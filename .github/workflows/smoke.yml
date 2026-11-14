@@ -1,0 +1,33 @@
+name: smoke
+
+# Sobe a stack inteira a partir dos repositórios no GitHub e confere que os serviços conversam.
+on:
+  push:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 9 * * 1" # toda segunda: pega mudança nos repositórios dos projetos
+
+jobs:
+  up:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - run: cp .env.example .env
+      - run: docker compose build
+      # --wait só nos serviços que ficam rodando; os de uma vez só (seed e relay) sobem depois
+      - run: docker compose up -d --wait --wait-timeout 180 ranking simulador mysql redis monitor dashboard painel loja prometheus
+      - run: docker compose up -d loja-seed relay-mod
+      - name: conferir
+        run: |
+          set -x
+          sleep 20
+          curl -fsS localhost:8080/ | grep -q '<div id="root">'
+          curl -fsS localhost:8080/api/monitor/api/status | grep -q '"name":"DIA-Z","address":"servidor-de-jogo:27016","up":true'
+          curl -fsS "localhost:8080/api/ranking/boards/kills?period=day" | grep -q '"rank":1'
+          curl -fsS -o /dev/null -w '%{http_code}' localhost:8090/ | grep -q 303
+          curl -fsS localhost:8081/health | grep -q ok
+          curl -fsS localhost:8081/api/products | grep -q COINS_500
+          timeout 10 curl -sN localhost:8080/api/ranking/stream | grep -m1 '^data'
+      - if: failure()
+        run: docker compose logs --tail 60
