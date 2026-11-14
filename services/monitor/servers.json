@@ -1,0 +1,9 @@
+{
+  "servers": [
+    { "name": "DIA-Z", "address": "servidor-de-jogo:27016" },
+    { "name": "Teste", "address": "servidor-de-jogo:27099" }
+  ],
+  "interval": "15s",
+  "timeout": "3s",
+  "fail_threshold": 3
+}
