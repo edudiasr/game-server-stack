@@ -1,0 +1,174 @@
+# Sobe os projetos juntos, conversando entre si:
+#
+#   painel ao vivo (React)  ->  Nginx  ->  a2s-monitor (Go)  ->  servidor de jogo (UDP)
+#                                     \->  ranking (Python)  ->  Redis
+#   simulador e relay do mod  ->  ranking
+#   painel da equipe (PHP)   ->  MySQL  <-  loja (C#)
+#   Prometheus  ->  a2s-monitor
+#
+# O código de cada serviço vem do repositório dele no GitHub (additional_contexts "src").
+# Pra testar mudanças locais, aponte as variáveis *_SRC pra pastas no disco (veja .env.example).
+
+name: game-server-stack
+
+x-restart: &restart
+  restart: unless-stopped
+
+services:
+  # ------------------------------------------------------------------ dados
+  mysql:
+    <<: *restart
+    image: mysql:8.4
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-root_dev}
+      PAINEL_DB_PASS: ${PAINEL_DB_PASS:-painel_dev}
+      STORE_DB_PASS: ${STORE_DB_PASS:-gamestore_dev}
+    volumes:
+      - mysql:/var/lib/mysql
+      - ./services/mysql/init.sh:/docker-entrypoint-initdb.d/init.sh:ro
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-p${MYSQL_ROOT_PASSWORD:-root_dev}"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  redis:
+    <<: *restart
+    image: redis:8-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  # ------------------------------------------------------------------ ranking (Python + Redis)
+  ranking:
+    <<: *restart
+    build:
+      context: ./services/ranking
+      additional_contexts:
+        src: ${RANKING_SRC:-https://github.com/edudiasr/realtime-leaderboard-redis.git#main}
+    environment:
+      LB_REDIS_URL: redis://redis:6379/0
+      LB_API_KEY: ${LB_API_KEY:-troque-esta-chave}
+    depends_on:
+      redis: { condition: service_healthy }
+    ports: ["8000:8000"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health')"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  # kills de mentira pro ranking e o painel ao vivo terem movimento
+  simulador:
+    <<: *restart
+    build:
+      context: ./services/ranking
+      additional_contexts:
+        src: ${RANKING_SRC:-https://github.com/edudiasr/realtime-leaderboard-redis.git#main}
+    command: ["python", "scripts/simulate.py", "--url", "http://ranking:8000", "--key", "${LB_API_KEY:-troque-esta-chave}", "--rate", "0.4", "--seconds", "1e9"]
+    depends_on:
+      ranking: { condition: service_healthy }
+    logging:
+      driver: none
+
+  # o relay do mod de DayZ mandando o killfeed.jsonl de exemplo uma vez pro ranking
+  relay-mod:
+    build:
+      context: ./services/relay
+      additional_contexts:
+        src: ${MOD_SRC:-https://github.com/edudiasr/dayz-server-stats.git#main}
+    environment:
+      LB_API_KEY: ${LB_API_KEY:-troque-esta-chave}
+    depends_on:
+      ranking: { condition: service_healthy }
+    restart: "no"
+
+  # ------------------------------------------------------------------ monitor (Go)
+  servidor-de-jogo:
+    <<: *restart
+    build:
+      context: ./services/monitor
+      additional_contexts:
+        src: ${MONITOR_SRC:-https://github.com/edudiasr/a2s-monitor.git#main}
+    command: ["fake", "-listen", "0.0.0.0:27016", "-name", "DIA-Z | Hardcore", "-max", "60"]
+
+  monitor:
+    <<: *restart
+    build:
+      context: ./services/monitor
+      additional_contexts:
+        src: ${MONITOR_SRC:-https://github.com/edudiasr/a2s-monitor.git#main}
+    volumes:
+      - ./services/monitor/servers.json:/config/servers.json:ro
+    depends_on: [servidor-de-jogo]
+    ports: ["9105:9105"]
+
+  prometheus:
+    <<: *restart
+    image: prom/prometheus:v3.5.0
+    volumes:
+      - ./services/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    depends_on: [monitor]
+    ports: ["9090:9090"]
+
+  # ------------------------------------------------------------------ painel ao vivo (React)
+  dashboard:
+    <<: *restart
+    build:
+      context: ./services/dashboard
+      additional_contexts:
+        src: ${DASHBOARD_SRC:-https://github.com/edudiasr/server-dashboard.git#main}
+    depends_on:
+      ranking: { condition: service_healthy }
+      monitor: { condition: service_started }
+    ports: ["8080:80"]
+
+  # ------------------------------------------------------------------ painel da equipe (PHP)
+  painel:
+    <<: *restart
+    build:
+      context: ./services/painel
+      additional_contexts:
+        src: ${PAINEL_SRC:-https://github.com/edudiasr/server-admin-php.git#main}
+    environment:
+      PAINEL_NOME: ${PAINEL_NOME:-DIA-Z}
+      PAINEL_DB_DSN: mysql:host=mysql;port=3306;dbname=painel;charset=utf8mb4
+      PAINEL_DB_USER: painel
+      PAINEL_DB_PASS: ${PAINEL_DB_PASS:-painel_dev}
+      PAINEL_DEMO: ${PAINEL_DEMO:-1}
+    depends_on:
+      mysql: { condition: service_healthy }
+    ports: ["8090:80"]
+
+  # ------------------------------------------------------------------ loja (C# + MySQL)
+  loja:
+    <<: *restart
+    build:
+      context: ./services/loja
+      additional_contexts:
+        src: ${LOJA_SRC:-https://github.com/edudiasr/game-store-mysql.git#main}
+    environment:
+      ConnectionStrings__Store: Server=mysql;Port=3306;Database=gamestore;User ID=gamestore;Password=${STORE_DB_PASS:-gamestore_dev}
+      Payments__WebhookSecret: ${STORE_WEBHOOK_SECRET:-troque-este-segredo}
+    depends_on:
+      mysql: { condition: service_healthy }
+    ports: ["8081:8080"]
+
+  loja-seed:
+    build:
+      context: ./services/loja-seed
+      additional_contexts:
+        src: ${LOJA_SRC:-https://github.com/edudiasr/game-store-mysql.git#main}
+    environment:
+      STORE_DB_PASS: ${STORE_DB_PASS:-gamestore_dev}
+    depends_on: [loja]
+    restart: "no"
+
+volumes:
+  mysql:
+  redis:
